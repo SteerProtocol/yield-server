@@ -1,108 +1,92 @@
-const { request } = require('graphql-request');
-const sdk = require('@defillama/sdk');
-const utils = require('../utils');
 const axios = require('axios');
+const utils = require('../utils');
 
-// add chain deployments and subgraph endpoints here
-const supportedChains = [
-  {
-    name: 'Polygon',
-    subgraphEndpoint: sdk.graph.modifyEndpoint(
-      'uQxLz6EarmJcr2ymRRmTnrRPi8cCqas4XcPQb71HBvw'
-    ),
-  },
-  {
-    name: 'Arbitrum',
-    subgraphEndpoint: sdk.graph.modifyEndpoint(
-      'HVC4Br5yprs3iK6wF8YVJXy4QZWBNXTCFp8LPe3UpcD4'
-    ),
-  },
-  {
-    name: 'Optimism',
-    subgraphEndpoint: sdk.graph.modifyEndpoint(
-      'GgW1EwNARL3dyo3acQ3VhraQQ66MHT7QnYuGcQc5geDG'
-    ),
-  },
-];
+// Fallback endpoint if env var is not provided
+const STEER_API_ENDPOINT = 'https://api-v2.steer.finance'
 
-// Fetch active vaults and associated data @todo limited to 1000 per chain
+// Mapping of chain IDs returned by the Steer API to DefiLlama chain names
+const chainIdToName = {
+  1: 'Ethereum',
+  10: 'Optimism',
+  56: 'Binance',
+  137: 'Polygon',
+  42161: 'Arbitrum',
+  43114: 'Avalanche',
+  8453: 'Base',
+  747474: 'Katana',
+  59144: 'Linea',
+};
+
+// GraphQL query for the new Steer API (v2) – allows filtering by chainId
 const query = `
-{
-    vaults(first: 1000, where: {totalLPTokensIssued_not: "0"}) {
-      weeklyFeeAPR
-      beaconName
-      feeTier
-      id
-      pool
-      token0
-      token0Symbol
-      token0Decimals
-      token1
-      token1Symbol
-      token1Decimals
-      totalLPTokensIssued
-      totalAmount1
-      totalAmount0
-      strategyToken {
-        id
+  query($filter: VaultFilter, $first: Int, $orderBy: OrderByInput) {
+    vaults(filter: $filter, first: $first, orderBy: $orderBy) {
+      edges {
+        node {
+          id
+          chainId
+          vaultAddress
+          token0 { address symbol decimals }
+          token1 { address symbol decimals }
+          beaconName
+          tvl
+          feeApr
+        }
       }
     }
-  }`;
+  }
+`;
 
 const getPools = async () => {
-  const pools = [];
-  for (const chainInfo of supportedChains) {
-    try {
-      const data = await request(chainInfo.subgraphEndpoint, query);
-      // get tokens
-      const tokenList = new Set();
-      data.vaults.forEach((vaultInfo) => {
-        tokenList.add((chainInfo.name + ':' + vaultInfo.token0).toLowerCase());
-        tokenList.add((chainInfo.name + ':' + vaultInfo.token1).toLowerCase());
-      });
+  try {
+    const allPools = [];
 
-      // get prices
-      const tokenPrices = (
-        await axios.get(
-          `https://coins.llama.fi/prices/current/${[...tokenList]}`
-        )
-      ).data.coins;
+    // iterate over every known chainId so we query in smaller chunks and easily parallelize in future if desired
+    for (const chainId of Object.keys(chainIdToName)) {
+      const variables = {
+        filter: { chainId: Number(chainId) },
+        first: 100,
+        orderBy: { field: 'tvl', direction: 'DESC' },
+      };
 
-      const chainPools = data.vaults.map((vault) => {
-        // calculate tvl
-        const totalUSD0 =
-          (Number(vault.totalAmount0) *
-            tokenPrices[`${chainInfo.name.toLowerCase()}:${vault.token0}`]
-              ?.price) /
-          10 ** Number(vault.token0Decimals);
-        const totalUSD1 =
-          (Number(vault.totalAmount1) *
-            tokenPrices[`${chainInfo.name.toLowerCase()}:${vault.token1}`]
-              ?.price) /
-          10 ** Number(vault.token1Decimals);
-        const poolTvl = totalUSD0 + totalUSD1;
+      const res = await axios.post(
+        STEER_API_ENDPOINT,
+        { query, variables },
+        { headers: { 'Content-Type': 'application/json' } }
+      );
+
+      const edges = (res?.data?.data?.vaults?.edges ?? []).filter(
+        (vault) => vault.node.token0 != null && vault.node.token1 != null || vault.beaconName == 'ScheduledJobs'
+      );
+
+      const pools = edges.map(({ node: vault }) => {
+        const chain = chainIdToName[vault.chainId];
+        if (!chain) return null;
+        if (vault.token0 == null || vault.token1 == null) {
+          debugger;
+        }
         return {
-          pool: (vault.id + '-' + chainInfo.name).toLowerCase(),
-          chain: chainInfo.name, // chain where the pool is (needs to match the `name` field in here https://api.llama.fi/chains)
-          project: 'steer-protocol', // protocol (using the slug again)
-          symbol: vault.token0Symbol + '-' + vault.token1Symbol, // symbol of the tokens in pool, can be a single symbol if pool is single-sided or multiple symbols (eg: USDT-ETH) if it's an LP
-          tvlUsd: poolTvl, // number representing current USD TVL in pool
-          apyBase: parseFloat(vault.weeklyFeeAPR), // APY from pool fees/supplying in %
-          underlyingTokens: [vault.token0, vault.token1], // Array of underlying token addresses from a pool, eg here USDT address on ethereum
-          poolMeta: vault.beaconName.replace('MultiPosition', ''),
-          url:
-            'https://app.steer.finance/app/' +
-            vault.strategyToken.id +
-            '/vault/' +
-            vault.id,
+          pool: `${vault.vaultAddress}-${chain}`.toLowerCase(),
+          chain,
+          project: 'steer-protocol',
+          symbol: `${vault.token0.symbol}-${vault.token1.symbol}`,
+          tvlUsd: Number(vault.tvl),
+          apyBase: Number(vault.feeApr),
+          underlyingTokens: [vault.token0.address, vault.token1.address],
+          poolMeta: vault.beaconName?.replace('MultiPosition', '') ?? null,
+          url: `https://app.steer.finance/app/${vault.vaultAddress}`,
         };
       });
-      pools.push(...chainPools);
-    } catch (err) {
-      console.log(err.message);
+
+      allPools.push(...pools);
     }
+
+    return allPools.filter((p) => p && utils.keepFinite(p)).filter(p => p.tvlUsd > 10000);
+  } catch (err) {
+    debugger;
+    console.error('Steer adaptor error:', err.message);
+    return [];
   }
-  return pools.filter((i) => utils.keepFinite(i));
 };
 
 module.exports = {
